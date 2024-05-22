@@ -1,0 +1,516 @@
+import asyncio
+from collections import defaultdict
+import traceback
+
+CHANNEL_ID=-1002017335161
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# FILE_MAX_SIZE_BYTES = int(2 * 1e9) # 2GB
+
+FILE_MAX_CHUNKS=1907     #1 chunk = 1MiB
+FILE_MAX_SIZE_BYTES=int(1907*1024*1024)
+
+#extra chunks to download
+EXTRA_CHUNKS=10
+
+# Real LRU cache implementation very cool
+CACHE_MAXSIZE = 5e9 # 5GB
+
+class TelegramFile:
+    def __init__(self, client, msg_ids):
+        self.client = client
+        self.cached_files = {}
+        self.will_be_available = set()
+        self.ongoing_download_connections = 0
+        self.channel_entity= CHANNEL_ID
+        self.msg_ids=msg_ids
+        self.messages_list=None
+        self.lock = asyncio.Lock()
+        self.generators=0
+        self.sent_request_to_make_available=set()
+        self.running_generator_objects=[]
+
+    
+    async def get_messages(self, force_api=False):
+        #todo implement force_api
+        if self.messages_list:
+            return self.messages_list
+        else:
+            print(f"[BYME][TELEGRAM API] get msg ids {self.msg_ids}")
+            try:
+                self.messages_list = await self.client.get_messages(self.channel_entity, self.msg_ids)
+                return self.messages_list
+            except Exception as e:
+                print(f"Error 09a. msg ids:{self.msg_ids}\n{traceback.format_exc()}")
+            
+    def global_index_to_this(self, global_chunk_index):    #for chunks(mb)
+            file_index=global_chunk_index//FILE_MAX_CHUNKS
+            this_chunk_index= global_chunk_index % FILE_MAX_CHUNKS
+            assert type(file_index) == int
+            assert type(this_chunk_index) == int
+
+            return file_index, this_chunk_index
+
+
+    def this_index_to_global(self, file_index, this_chunk_index):  #for chunks(mb)
+        global_index= file_index * FILE_MAX_CHUNKS +this_chunk_index
+        return global_index
+
+
+
+    async def get_file_chunk_from_cache(self, offset):
+        async with self.lock:  # Ensure atomic operation with lock
+            # if offset in self.cached_files and self.cached_files[offset] != bytearray():
+            if offset in self.cached_files and self.cached_files[offset] not in [bytearray(), None]:
+                #exists in cache
+                return self.cached_files[offset]
+        
+        #not available in cache
+        raise Exception("Cache unavailable")
+    
+
+    async def tele_download_generator(self, global_offset):
+        print("DEPRECATED ")
+        raise
+        messages= await self.get_messages()
+        file_index, current_this_chunk_index = self.global_index_to_this(global_offset)
+        current_global_index=global_offset
+        
+        async with self.lock:
+            #if a generator needs to be started from this offset
+            pass
+
+
+        #if needs to be started   
+        async for chunk in self.client.stream_media(messages[file_index], offset= current_this_chunk_index):
+            # cache it rn
+            self.cached_files[current_global_index] = bytearray(chunk)
+            print(f"Got offset {current_global_index}; will_be_available: {self.will_be_available}")
+            
+            try:
+                self.will_be_available.remove(current_global_index)
+            except:
+                pass
+
+            if current_global_index+1 in self.will_be_available:
+                current_global_index+=1
+                continue
+            else:
+                await asyncio.sleep(2)
+                if current_global_index+1 in self.will_be_available:
+                    current_global_index+=1
+                    continue
+        
+        async with self.lock:
+            self.generators-=1
+            print(f"[-1][{self.generators}]Telegram generator offsets {new_generator}-{current_global_index}")
+
+
+    
+        
+
+
+    async def make_available(self, start_chunk_offset:int):   #global start chunk offset
+        print("DEPRECATED ")
+        raise
+
+        print(f"make available for offset {start_chunk_offset}")
+        new_generator=-1
+        for chunk_offset in range(start_chunk_offset, start_chunk_offset+EXTRA_CHUNKS):
+            try:
+                print("here104")
+                await self.get_file_chunk_from_cache(start_chunk_offset)
+                print("here105")
+                # print("Got chunk from cache llll")
+            except Exception as e:
+                # Cache unavailable
+                print("here106")
+
+                async with self.lock:  
+                    if new_generator!=-1:
+                        print("here102")
+                        #already created generator
+                        self.will_be_available.add(chunk_offset)
+
+                    elif chunk_offset -1 in self.will_be_available:
+                        print("here103")
+                        # chunk assigned to existing generator
+                        self.will_be_available.add(chunk_offset)
+                    else:
+                        print("here101")
+                        #new generator create
+                        #this fucntion be only be used for one file downloading so no problem in creating a gnerator and break
+                        new_generator= chunk_offset
+                        self.will_be_available.add(chunk_offset)
+                        self.cached_files[chunk_offset]=None
+                
+        if new_generator!=-1:
+            print("generator started")
+            messages= await self.get_messages()
+            file_index, current_this_chunk_index = self.global_index_to_this(new_generator)
+            current_global_index=new_generator
+            
+            async with self.lock:
+                self.generators+=1
+                print(f"[+1][{self.generators}]Telegram generator from offset {new_generator}")
+            async for chunk in self.client.stream_media(messages[file_index], offset= current_this_chunk_index):
+                # cache it rn
+                self.cached_files[current_global_index] = bytearray(chunk)
+                print(f"Got offset {current_global_index}; will_be_available: {self.will_be_available}")
+                
+                try:
+                    self.will_be_available.remove(current_global_index)
+                except:
+                    pass
+
+                if current_global_index+1 in self.will_be_available:
+                    current_global_index+=1
+                    continue
+                else:
+                    await asyncio.sleep(2)
+                    if current_global_index+1 in self.will_be_available:
+                        current_global_index+=1
+                        continue
+            
+            async with self.lock:
+                self.generators-=1
+                print(f"[-1][{self.generators}]Telegram generator offsets {new_generator}-{current_global_index}")
+
+
+
+    async def get_file_multiple_chunks(self, global_offset_in_mb, number_of_chunks_in_mb):
+        # print("here3")
+        start_file_index, start_file_this_chunk_offset = self.global_index_to_this(global_offset_in_mb)
+        end_file_index, end_file_this_chunk_index = self.global_index_to_this(global_offset_in_mb+number_of_chunks_in_mb-1)
+
+
+        result_buffer = bytearray()
+        for file_index in range(start_file_index, end_file_index + 1):
+            # print("here4")
+            msg_id=self.msg_ids[file_index]
+
+            if file_index == start_file_index:
+                this_file_index_offset = start_file_this_chunk_offset
+            else:
+                this_file_index_offset = 0
+
+            if file_index == end_file_index:
+                this_file_number_of_chunk = end_file_this_chunk_index + 1 - this_file_index_offset
+            else:
+                this_file_number_of_chunk = FILE_MAX_CHUNKS - this_file_index_offset
+
+
+            # print("here5")
+            print(f"get one file multiple chunks for file index {file_index}\nthis_file_index_offset {this_file_index_offset}\n this_file_number_of_chunk{this_file_number_of_chunk}")
+            one_file_multiple_chunk_data = await self.get_one_file_multiple_chunks(file_index, this_file_index_offset, this_file_number_of_chunk)
+            result_buffer.extend(one_file_multiple_chunk_data)
+            del one_file_multiple_chunk_data
+
+
+        return result_buffer    #in mb chunks, bytearray
+    
+    async def create_make_available_task(self, global_current_offset):
+        create_task=False
+        async with self.lock:
+            for i in range(global_current_offset, global_current_offset + EXTRA_CHUNKS):
+                if i not in self.sent_request_to_make_available:
+                    self.sent_request_to_make_available.add(i)
+                    create_task=True
+        
+        if create_task:
+            print("Created task")
+            asyncio.create_task(self.make_available(global_current_offset))
+
+
+    async def get_one_file_multiple_chunks(self, file_index, this_file_index_offset_mb,this_file_number_of_chunk_mb):
+        result = bytearray()
+        this_file_current_offset, remaining_chunks = this_file_index_offset_mb, this_file_number_of_chunk_mb
+        global_current_offset= self.this_index_to_global(file_index, this_file_current_offset)
+        # print("here6")
+
+        print(f"require {this_file_index_offset_mb} no of chunks {this_file_number_of_chunk_mb}")
+
+        async with self.lock:
+            while remaining_chunks > 0:
+                #this chunk exists in cache
+                if global_current_offset in self.cached_files and self.cached_files[global_current_offset] not in [bytearray(), None]:
+                    
+                    # print("CACHE HIT")
+
+                    #tell generator this chunk was accessed
+                    existing_generator_found=False
+                    for gen in self.running_generator_objects:
+                        if existing_generator_found:
+                            break
+
+                        #found generator
+                        if await gen.can_generate(global_current_offset):
+                            existing_generator_found=True
+                    
+
+                    # print(f"CACHE HIT chunk offset {global_current_offset}")
+                    result.extend(self.cached_files[global_current_offset])
+                    this_file_current_offset += 1
+                    global_current_offset+=1
+                    remaining_chunks -= 1
+                    # print(f"Remaining chunks: {remaining_chunks}")
+
+                #lets make this chunk available
+                else:
+                    existing_generator_found=False
+                    for gen in self.running_generator_objects:
+                        if existing_generator_found:
+                            break
+
+                        #found generator
+                        if await gen.can_generate(global_current_offset):
+                            existing_generator_found=True
+                            if self.cached_files[global_current_offset] !=bytearray():
+                                result.extend(self.cached_files[global_current_offset])
+                            else:
+                                pass
+                            this_file_current_offset += 1
+                            global_current_offset+=1
+                            remaining_chunks -= 1
+                    
+                    if not existing_generator_found:
+                        #create new generator object
+                        
+                        gen=TelegramFileGenerator(self, global_current_offset)
+                        await gen.can_generate(global_current_offset)
+                        self.running_generator_objects.append(gen)
+                        result.extend(self.cached_files[global_current_offset])
+                        this_file_current_offset += 1
+                        global_current_offset+=1
+                        remaining_chunks -= 1
+                        
+
+
+                        
+        print(f"got {this_file_index_offset_mb}")
+            
+
+        # print("here7")
+        return result
+
+
+
+    async def get_max_global_offset(self):
+        messages = await self.get_messages(self.msg_ids)
+        total_file_size_in_bytes = sum([msg.document.file_size for msg in messages])
+        chunk_size = 1 * 1024 * 1024
+        max_global_offset = (total_file_size_in_bytes) // chunk_size
+        # print("max global offset is: ", max_global_offset)
+        return max_global_offset
+
+
+    async def get_file(self, offset_in_bytes, length_in_bytes):
+        # await self.get_max_global_offset()
+        # print(f"get file offset bytes {offset_in_bytes}")
+        msg_ids=self.msg_ids
+        chunk_size = 1 * 1024 * 1024
+        messages = await self.get_messages(msg_ids)
+        total_file_size_in_bytes = sum([msg.document.file_size for msg in messages])
+
+        if not offset_in_bytes:
+            offset_in_bytes = 0
+        if not length_in_bytes:
+            length_in_bytes = total_file_size_in_bytes - offset_in_bytes
+
+
+        #edit input parameter to not ask for bytes outside file size
+        endset_in_bytes= offset_in_bytes+length_in_bytes -1
+        if offset_in_bytes > total_file_size_in_bytes-1:
+            print(f"offset was more than available {offset_in_bytes} return empty")
+            return bytearray()
+        elif endset_in_bytes > total_file_size_in_bytes -1:
+            # endset_in_bytes = total_file_size_in_bytes -1
+            length_in_bytes = total_file_size_in_bytes - offset_in_bytes
+            print(f"Endset changed. Now length in bytes {length_in_bytes}. total_file_size_in_bytes{total_file_size_in_bytes}")
+
+        start_chunk_index = offset_in_bytes // chunk_size
+        end_chunk_index = (offset_in_bytes + length_in_bytes - 1) // chunk_size
+        start_byte_offset_within_chunk = offset_in_bytes % chunk_size
+        end_byte_offset_within_chunk = (offset_in_bytes + length_in_bytes - 1) % chunk_size
+
+        global_more_chunks = end_chunk_index + 1 - start_chunk_index   #no of chunks
+        global_start_chunk_index = start_chunk_index
+        global_end_chunk_index = end_chunk_index
+
+        # print("here0")
+        print(f"global_start_chunk_index{global_start_chunk_index}, offset_in_bytes {offset_in_bytes}")
+        result_buffer=await self.get_file_multiple_chunks(global_start_chunk_index, global_more_chunks)
+        
+        out = result_buffer[start_byte_offset_within_chunk:(start_byte_offset_within_chunk + length_in_bytes)]
+
+        # print(f"returning bytes with offset bytes{offset_in_bytes}")
+        return out
+
+
+
+
+
+
+class TelegramFileGenerator:
+
+    #todo max offset fucntion
+    #toddo global offset is in input. handle that
+    def __init__(self, telegram_file:TelegramFile, global_offset:int):
+        self.begin_offset=global_offset
+        self.file=telegram_file
+        self.current_global_index=global_offset   #this offset is not available now
+        self.lock = asyncio.Lock()
+        self.completed= False
+        self.file_index, self.this_begin_chunk_offset = self.file.global_index_to_this(self.begin_offset)
+        self.max=None
+        self.make_available_offset=global_offset #+EXTRA_CHUNKS
+        self.generator=None
+        self.messages=None
+        self.background_task = asyncio.create_task(self.run_background_task())
+        
+
+
+        print(f"Object {self.begin_offset} is created")
+        return None
+
+    def __del__(self):
+        print(f"Object {self.begin_offset} is destroyed")
+        self.background_task.cancel()
+
+
+    async def run_background_task(self):
+        if self.messages == None:
+            await self.max_global_offset_for_this_file()
+        while self.completed == False:
+            await asyncio.sleep(0)
+            # print("\n In background fucntion\n")
+            if self.make_available_offset >= self.current_global_index:
+                print(f"Background generating till {self.make_available_offset}")
+                await self.generate_next()
+                # async for _ in self.generate_next():
+                #     break
+                continue
+            print(f"bg sleep for 5s object {self.begin_offset}")
+            await asyncio.sleep(5)
+
+            
+
+
+
+    async def max_global_offset_for_this_file(self):
+        if self.max != None:
+            return self.max
+        self.messages = await self.file.get_messages()
+        self.total_file_size_bytes=self.messages[self.file_index].document.file_size
+        self.max= (self.file_index*FILE_MAX_SIZE_BYTES+self.total_file_size_bytes-1)//(1024*1024)
+        return self.max
+
+
+    #not for maqnual use
+    async def generate_next(self):
+        if self.generator is None:
+            self.generator = self._generate_chunks()
+        
+        async with self.lock:
+            print("aa1")
+            try:
+                async for _ in self.generator:
+                    print("aa2")
+                    return
+                return
+            except:
+                print("Exception dfj38")
+                return
+            
+
+        
+    #NOT FOR MANUAL USAGE
+    async def _generate_chunks(self):
+        # messages= await self.file.get_messages()
+        # self.current_global_index=self.begin_offset
+        if self.current_global_index>await self.max_global_offset_for_this_file():
+            self.completed=True
+
+        if self.completed:
+            print(f"This object is already completed. {self.begin_offset}")
+            yield
+        
+        # print("\n\nThis should not print more than once\n\n")
+        async for chunk in self.file.client.stream_media(self.messages[self.file_index], offset= self.this_begin_chunk_offset):
+            self.file.cached_files[self.current_global_index] = bytearray(chunk)
+            print(f"Got offset {self.current_global_index}")
+            self.current_global_index += 1
+            # async with self.lock:
+            #     a=self.current_global_index
+            #     self.current_global_index+=1
+            #     assert self.current_global_index == a+1
+            yield
+
+        self.completed=True
+        # del self
+        #also delete this generator
+        
+
+
+    #NOT FOR MANUAL USAGE
+    async def generate_till(self, global_offset_required):
+        # async with self.lock:
+        #     for _ in range(global_offset_required - self.current_global_index +1):
+        #         await self.generate_next()
+        
+
+        if self.current_global_index > global_offset_required:
+            print("Skipped generate_till")
+        while self.current_global_index <= global_offset_required:
+            print(f"fpr {global_offset_required}")
+            await self.generate_next()
+
+        print("here31", global_offset_required)
+
+
+
+
+    #USE THIS ALWAYS
+    async def can_generate(self, required_global_offset):  #if return True, already generated required chunks
+        if required_global_offset< self.begin_offset:
+            return False
+        
+        if required_global_offset < self.current_global_index:
+            #chunk already exists
+            print("here0")
+            if self.current_global_index<=await self.max_global_offset_for_this_file():
+                #todo destroy task if already exists
+                # asyncio.create_task(self.generate_till(required_global_offset+EXTRA_CHUNKS))
+                if self.make_available_offset < required_global_offset+EXTRA_CHUNKS:
+                    if required_global_offset+EXTRA_CHUNKS> await self.max_global_offset_for_this_file():
+                        self.make_available_offset= await self.max_global_offset_for_this_file()
+                    else:
+                        self.make_available_offset= required_global_offset+EXTRA_CHUNKS
+            return True
+        
+        
+        elif required_global_offset <= await self.max_global_offset_for_this_file() and required_global_offset-self.current_global_index < 10:
+            print("here1")
+            print(f"Generating till {required_global_offset}")
+            await self.generate_till(required_global_offset)
+            print(f"Done Generating till {required_global_offset}")
+            # asyncio.create_task(self.generate_till(required_global_offset+EXTRA_CHUNKS))
+            if self.make_available_offset < required_global_offset+EXTRA_CHUNKS:
+                    if required_global_offset+EXTRA_CHUNKS> await self.max_global_offset_for_this_file():
+                        self.make_available_offset= await self.max_global_offset_for_this_file()
+                    else:
+                        self.make_available_offset= required_global_offset+EXTRA_CHUNKS
+            print(f"Returning Generating till {required_global_offset}")
+            return True
+        return False
+    
+
+    def stats(self):
+        return (self.begin_offset, self.current_global_index)
+        
+
+
+
+

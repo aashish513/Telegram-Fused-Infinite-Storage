@@ -1,0 +1,471 @@
+# import logging
+#logging.basicConfig(filename='example.log', encoding='utf-8', level=logging.DEBUG)
+import asyncio
+from pyrogram import Client, filters
+from dotenv import load_dotenv
+import os
+from io import BytesIO
+from cryptography.fernet import Fernet
+from collections import defaultdict
+from cachetools import LRUCache
+import gc
+import traceback
+import threading
+
+load_dotenv()
+
+# FILE_MAX_SIZE_BYTES = int(2 * 1e9) # 2GB
+
+FILE_MAX_CHUNKS=1907     #1 chunk = 1MiB
+FILE_MAX_SIZE_BYTES=int(1907*1024*1024)
+
+#extra chunks to download
+EXTRA_CHUNKS=10
+
+# Real LRU cache implementation very cool
+CACHE_MAXSIZE = 5e9 # 5GB
+def getsizeofelt(val):
+    try:
+        s = len(val)
+        return s
+    except:
+        return 1
+
+def progress_cb(sent_bytes, total):
+    percentTotal = int(sent_bytes/total * 100)
+    if percentTotal % 5 == 0:
+        print(f"Progress: {percentTotal}%...")
+
+class TelegramFileClient():
+    def __init__(self, session_name, api_id, api_hash, channel_id):
+        self.client = Client(session_name, api_id=api_id, api_hash=api_hash)
+        self.client.start()
+        print(self.client.get_me())
+        self.channel_entity = channel_id
+        # key to use for encryption, if not set, not encrypted.
+        self.encryption_key = os.getenv("ENCRYPTION_KEY")
+        self.cached_files = LRUCache(CACHE_MAXSIZE, getsizeof=getsizeofelt)
+        self.cached_tele_messages = LRUCache(1e9/10, getsizeof=getsizeofelt)
+        self.fname_to_msgs = defaultdict(tuple)
+        self.ongoing_download_connections=0
+        self.will_be_available={}   #{msg_id:[this_offset_in_mb]}
+
+        print("USING ENCRYPTION: ", self.encryption_key != None)
+
+    
+
+    #IMPLEMENTATION Not removed BYME
+    def get_cached_file(self, fh, offset, length):
+        # print(type(fh))
+        # print(self.cached_files)
+        # print(type(self.cached_files))
+        #print(f"[BYME] CACHE REQUIRED fh {fh} offset:{offset}, length:{length}")
+        #return None
+        if fh in self.cached_files and self.cached_files[fh] != bytearray(b''):
+            print("CACHE HIT")
+            return self.cached_files[fh]
+        return None
+
+    # download entire file from telegram
+    async def download_file(self, fh, msgIds, offset=None, length=None):
+        print("Deprecated fucntion ran! 24")
+        return
+    
+        print(f"[BYME] DOWNLOAD FUNCTION offset {offset}, length {length}")
+        if fh in self.cached_files and self.cached_files[fh] != bytearray(b''):
+            print("CACHE HIT in download")
+            return self.cached_files[fh]
+        msgs = await self.get_messages(msgIds)
+        buf = BytesIO()
+        for m in msgs:
+            try:
+                _=await self.download_message(m)
+                buf.write(_.getvalue()) # error handling WHO??
+            except Exception as e:
+                print(f"EXCPEPTION 42: {e}")
+        numBytes = buf.getbuffer().nbytes
+        print(f"Downloaded file is size {numBytes}")
+        buf.seek(0)
+        readBytes = buf.read()
+
+        if self.encryption_key != None:
+            print("DECRYPTING")
+            f = Fernet(bytes(self.encryption_key, 'utf-8'))
+            readBytes = f.decrypt(readBytes)
+
+        barr = bytearray(readBytes)
+        # add to cache
+        self.cached_files[fh] = barr    #BYME comment to not save to cache
+        return barr
+
+    async def get_messages(self, ids, force_api=False):
+        #todo implement force_api
+        if ids[0] in self.cached_tele_messages:
+            return self.cached_tele_messages[ids[0]]
+        print(f"[BYME][TELEGRAM API] get msg ids {ids}")
+        result = await self.client.get_messages(self.channel_entity, ids)
+        self.cached_tele_messages[ids[0]]=result
+        return result
+
+    async def download_message(self, msg):
+        print(f"[BYME][TELEGRAM API] download media form msg id {msg.id}")
+        try:
+            result = await self.client.download_media(msg, in_memory=True, progress=progress_cb)
+            return result
+        except:
+            print("Errore3498")
+            print(traceback.format_exc())
+    
+    def delete_messages(self, ids):
+        print("BYME Sorry wont delete msgs. preserving filesystem history")
+        return
+        return self.client.delete_messages(self.channel_entity, message_ids=ids)
+    
+
+    async def get_file(self, msg_ids, offset_in_bytes, length_in_bytes):
+        # print(f"get file offset bytes {offset_in_bytes}, length_bytes:{length_in_bytes} ")
+        messages_list=None
+        async def get_from_telegram_api(self,msg_ids,msg,this_offset, global_offset):
+            current_offset=this_offset
+            self.ongoing_download_connections+=1
+            print(f"Download connection increased by one {self.ongoing_download_connections}\nDownloading from offset {current_offset}")
+            async for chunk in self.client.stream_media(msg, offset= this_offset):
+                chunk_bytearray= bytearray(chunk)
+                self.cached_files[msg_ids[0]][global_offset]=chunk_bytearray
+                self.will_be_available[msg.id].remove(current_offset)
+                print(f"Cached offset {current_offset}")
+                print(self.will_be_available[msg.id])
+
+                current_offset+=1
+                global_offset+=1
+
+                if current_offset in self.will_be_available[msg.id]:
+                    continue
+                else:
+                    await asyncio.sleep(1)
+                    if current_offset in self.will_be_available[msg.id]:
+                        continue
+                    break
+            self.ongoing_download_connections-=1
+            print(f"Download connection decreased by one {self.ongoing_download_connections}\nDownloaded from offset {this_offset} till {current_offset -1}")
+
+
+        async def get_file_from_telegram_api_or_cache(client, msg_id_index, offset_in_mb, number_of_chunks, msg_ids, global_offset_in_mb):
+            def global_offset_from_this(current_offset_this):
+                global_offset = current_offset+(global_offset_in_mb-offset_in_mb)
+                return global_offset
+            result = bytearray()
+            #print(f"get_file_from_telegram_api_or_cache args msg_id_index:{msg_id_index}\nmsg_ids= {msg_ids}\nnumber_of_chunks:{number_of_chunks}")
+            messages_list=None
+            current_offset, remaining_chunks=offset_in_mb, number_of_chunks
+            
+
+            if msg_ids[0] not in self.cached_files:
+                self.cached_files[msg_ids[0]]={}
+            while remaining_chunks>0:
+                
+                
+
+                #if exists in cache
+                if global_offset_from_this(current_offset) in self.cached_files[msg_ids[0]] and self.cached_files[msg_ids[0]][global_offset_from_this(current_offset)] != bytearray():
+                    #make more next chunks available beforehand
+                    for l in range(EXTRA_CHUNKS):
+                        if current_offset+l not in self.will_be_available[msg_ids[msg_id_index]]:
+                            self.will_be_available[msg_ids[msg_id_index]].add(current_offset+l)
+
+                    #print("1. CACHE HIT for this chunk")
+                    print(f"Found chunk offset {current_offset}")
+                    # try:
+                    #     if remaining_chunks !=1:
+                    #         assert len(self.cached_files[msg_ids[0]][global_offset_from_this(current_offset)]) == 1024*1024
+                    # except:
+                    #     print("Errdskj33fwkj")
+
+                    result.extend(self.cached_files[msg_ids[0]][global_offset_from_this(current_offset)])
+                    current_offset+=1
+                    remaining_chunks-=1
+                    print(f"remain chunks= {remaining_chunks}")
+                        
+
+                #if will be available
+                elif msg_ids[msg_id_index] in self.will_be_available and current_offset in self.will_be_available[msg_ids[msg_id_index]]:
+
+                    #make more next chunks available beforehand
+                    for l in range(1, EXTRA_CHUNKS):
+                        if current_offset+l not in self.will_be_available[msg_ids[msg_id_index]]:
+                            self.will_be_available[msg_ids[msg_id_index]].add(current_offset+l)
+
+
+                    print(f"Sleeping and waiting for chunk offset {current_offset}")
+                    await asyncio.sleep(2)
+                    # continue
+            
+                else:
+                    if not messages_list:
+                        messages_list=await self.get_messages(msg_ids)
+                    
+                    self.ongoing_download_connections+=1
+                    if self.ongoing_download_connections>1 or self.ongoing_download_connections<0:
+                        print(f"\n\nCurrent connections to download: {self.ongoing_download_connections}\n\n")
+                    
+
+                    if msg_ids[msg_id_index] not in self.will_be_available:
+                        self.will_be_available[msg_ids[msg_id_index]]=set()
+
+                    #make more next chunks available beforehand
+                    for l in range(EXTRA_CHUNKS):
+                        if current_offset+l not in self.will_be_available[msg_ids[msg_id_index]]:
+                            self.will_be_available[msg_ids[msg_id_index]].add(current_offset+l)
+
+                    print("Creating asyncio task")
+                    task = asyncio.create_task(get_from_telegram_api(self, msg_ids, messages_list[msg_id_index],current_offset, global_offset_from_this(current_offset) ))
+
+                    # async for chunk in client.stream_media(messages_list[msg_id_index], limit=remaining_chunks, offset= current_offset):
+                    #     chunk_bytearray= bytearray(chunk)
+                    
+                    
+                        #integrity check
+                        # with open("avi_divx_original.avi",'rb') as orig:
+                        #     file=bytearray(orig.read())
+                        #     req_part= file[current_offset*1024*1024:current_offset*1024*1024+1024*1024]
+                        
+                        # try:
+                        #     if msg_id_index == 0:
+                        #         assert req_part == chunk_bytearray
+                        # except:
+                        #     print("\n\n Hayelaaa!!\n\n")
+                        #     print(f"Debug INFO\nreq_part_length:{len(req_part)}, chunk_bytearray_length:{len(chunk_bytearray)}")
+
+                        
+                        # self.cached_files[msg_ids[0]][global_offset_from_this(current_offset)]=chunk_bytearray
+                        # try:
+                        #     if remaining_chunks !=1:
+                        #         assert len(chunk_bytearray) == 1024*1024
+                        # except:
+                        #     print("Er2dskj33fwkj")
+                        # remaining_chunks-=1
+                        # print(f"Saved offset:{current_offset} for msg id:{msg_ids[0]} in cache!")
+                        # result.extend(chunk_bytearray)
+                        # if global_offset_from_this(current_offset)+1 in self.cached_files[msg_ids[0]] and self.cached_files[msg_ids[0]][global_offset_from_this(current_offset)+1] != bytearray():
+                            # print("2. Next chunk won't be downloaded from telegram. CACHE HIT")
+                            # break
+                        # print(f"remain chunks= {remaining_chunks}")
+                        # current_offset+=1
+                        # print("Cureent offset in tele downoad api : ", current_offset)
+                    # self.ongoing_download_connections-=1
+
+            print("returning bytes")
+            # result == 
+            return result
+        
+        def global_index_to_this(global_chunk_index):
+            file_index=global_chunk_index//FILE_MAX_CHUNKS
+            this_chunk_index= global_chunk_index % FILE_MAX_CHUNKS
+            assert type(file_index) == int
+            assert type(this_chunk_index) == int
+
+            return file_index, this_chunk_index
+
+        # Define chunk size in bytes (1 MiB)
+        chunk_size = 1 * 1024 * 1024
+        
+        if not offset_in_bytes:
+            offset_in_bytes = 0
+        if not length_in_bytes:
+            result = await self.get_messages(msg_ids)
+            length_in_bytes=0
+            for msg in result:
+                length_in_bytes+= msg.document.file_size
+            
+            assert type(length_in_bytes) == int
+            print(f"set length_in_bytes={length_in_bytes}")
+        # Calculate the start and end chunk indices
+        start_chunk_index = offset_in_bytes // chunk_size
+        end_chunk_index = (offset_in_bytes + length_in_bytes - 1) // chunk_size
+        
+        # Calculate the byte offsets within the chunks
+        start_byte_offset_within_chunk = offset_in_bytes % chunk_size
+        end_byte_offset_within_chunk = (offset_in_bytes + length_in_bytes - 1) % chunk_size
+
+        
+
+
+        
+        # Stream and collect the necessary chunks
+        #for chunk_index in range(start_chunk_index, end_chunk_index + 1):
+            # Stream the chunk from Telegram
+            # CHUNK_MAX_INDEX= FILE_MAX_CHUNKS -1
+
+
+     
+
+
+        global_more_chunks= end_chunk_index+1-start_chunk_index
+
+        global_start_chunk_index=start_chunk_index
+        global_end_chunk_index=end_chunk_index
+
+        start_msg_id_index, start_this_chunk_index= global_index_to_this(global_start_chunk_index)
+        end_msg_id_index, end_this_chunk_index= global_index_to_this(global_end_chunk_index)
+
+        # Create a buffer to hold the requested data
+        result_buffer = bytearray()
+
+
+        for msg_id_index in range(start_msg_id_index, end_msg_id_index+1):
+            if msg_id_index == start_msg_id_index:
+                this_offset=start_this_chunk_index
+                # print(f"fdkj this offset ={this_offset}")
+            else:
+                this_offset= 0
+                # print(f"fff this offset ={this_offset}")
+
+            if msg_id_index == end_msg_id_index:
+                this_number_of_chunk= end_this_chunk_index+1-this_offset
+                # print(f"fdkj this numebr of chunk ={this_number_of_chunk}")
+            else:
+                this_number_of_chunk= FILE_MAX_CHUNKS - this_offset
+                # print(f"ffff this numebr of chunk ={this_number_of_chunk}")
+            # print(f"this number of chunks = {this_number_of_chunk}")
+            multiple_chunk_data=await get_file_from_telegram_api_or_cache(self.client, msg_id_index, this_offset, this_number_of_chunk, msg_ids,global_start_chunk_index)
+            len_old=len(result_buffer)
+            result_buffer.extend(multiple_chunk_data)
+            try:
+                assert len_old+len(multiple_chunk_data) == len(result_buffer)
+            except:
+                print("potka here")
+            del multiple_chunk_data
+
+
+        
+        
+        
+        out=result_buffer[start_byte_offset_within_chunk:(start_byte_offset_within_chunk+length_in_bytes)]
+        # if end_byte_offset_within_chunk + 1 < chunk_size:
+        #     out = result_buffer[start_byte_offset_within_chunk: start_byte_offset_within_chunk+length_in_bytes]
+        # else:
+        #     out = result_buffer[start_byte_offset_within_chunk:]
+
+        # with open("avi_divx_original.avi",'rb') as orig:
+        #     file=bytearray(orig.read())
+        #     req_part= file[offset_in_bytes:offset_in_bytes+length_in_bytes]
+        #     try:
+        #         assert len(req_part) == length_in_bytes
+        #     except:
+        #         print("error 33")
+                
+        # try:
+        #     assert req_part == out
+        #     print(f"The file returned was indeed correct ")
+        # except:
+        #     print("\n\n\n\nYeah i was right\n\n\n\n")
+        #     if req_part in result_buffer:
+        #         print("bytearray sure is available in result buffer. slicing problem detected!")
+        #     elif req_part[10:-10] in result_buffer:
+        #         print("2nd bytearray sure is available in result buffer. slicing problem detected!")
+        #     else:
+        #         print("No Hopes!")
+
+
+#         try:
+#             assert len(out) == length_in_bytes
+#         except:
+#             print(f'''
+
+# Debug
+# start_byte_offset_within_chunk:{start_byte_offset_within_chunk}
+# end_byte_offset_within_chunk:{end_byte_offset_within_chunk}
+
+# sliced [{start_byte_offset_within_chunk}: {(start_byte_offset_within_chunk+length_in_bytes)}]
+# len_result_buffer:{len(result_buffer)}''')
+        return out   #bytearray
+
+
+
+
+
+        
+
+
+
+
+
+
+
+    async def upload_file(self, bytesio, fh, file_name=None, msg_ids=None):
+        print(f"[BYME] UPLOAD FUNCTION fh {fh}, filename {file_name}")
+        #testing by uploading at once
+        # fname = f"{file_name}.txt" # convert everything to text. tgram is weird about some formats
+        # chunkBytes = bytesio
+        # chunkBytes.name=fname
+        # bytesio.seek(0)
+        # result = await self.client.send_document(self.channel_entity,
+        #                                        bytesio,
+        #                                        file_name=fname,
+        #                                        progress=progress_cb)
+    
+        # return [result]
+    
+
+        # print(f"Type of bytesio {bytesio}")
+        # invalidate cache as soon as we upload file
+        if msg_ids and msg_ids[0] in self.cached_files:
+            self.cached_files.pop(msg_ids[0])
+            print("CLEANED UP ", gc.collect())
+
+        print("me111mmemme")
+        # file_bytes is bytesio obj
+        file_bytes = bytesio.read()
+        print("meaaammemme")
+        if self.encryption_key != None:
+            print("ENCRYPTING")
+            f = Fernet(bytes(self.encryption_key, 'utf-8'))
+            file_bytes = f.encrypt(file_bytes)
+
+        chunks = []
+        file_len = len(file_bytes)
+        print("memmemme")
+        if isinstance(file_len, float):
+            print("UH OH FILEBYTES LENGTH IS FLOAT", file_len)
+        if isinstance(FILE_MAX_SIZE_BYTES, float):
+            print("UH OH FILE_MAX_SIZE_BYTES IS FLOAT", FILE_MAX_SIZE_BYTES)
+
+        if file_len > FILE_MAX_SIZE_BYTES:
+            # Calculate the number of chunks needed
+            num_chunks = (len(file_bytes) + FILE_MAX_SIZE_BYTES) // FILE_MAX_SIZE_BYTES
+            
+            if isinstance(num_chunks, float):
+                print("UH OH num_chunks IS FLOAT", num_chunks)
+
+            # Split the file into chunks
+            for i in range(num_chunks):
+                start = i * FILE_MAX_SIZE_BYTES
+                end = (i + 1) * FILE_MAX_SIZE_BYTES
+                chunk = file_bytes[start:end]
+                chunks.append(chunk)
+        else:
+            # File is within the size limit, no need to split
+            chunks = [file_bytes]
+
+        upload_results = []
+
+        fname=file_name
+
+        i = 0
+        for c in chunks:
+            print("hjnj")
+            fname = f"{file_name}_part{i}.txt" # convert everything to text. tgram is weird about some formats
+            chunkBytes = BytesIO(c)
+            chunkBytes.name=fname
+            print(f"Type of chunkbytes {type(chunkBytes)}")
+            result = await self.client.send_document(self.channel_entity,
+                                               chunkBytes,
+                                               file_name=fname,
+                                               progress=progress_cb)
+            # result = self.client.send_file(self.channel_entity, f)
+            upload_results.append(result)
+            i += 1
+
+        self.fname_to_msgs[file_name] = tuple([m.id for m in upload_results])
+        print(f"CACHED FILE! NEW SIZE: {self.cached_files.currsize}; maxsize: {self.cached_files.maxsize}")
+        return upload_results
